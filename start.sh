@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
 FRONTEND_PORT="${FRONTEND_PORT:-9191}"
+FRONTEND_MODE="${FRONTEND_MODE:-preview}"
 BACKEND_PORT="${BACKEND_PORT:-9192}"
 LOG_DIR="${LOG_DIR:-/tmp/video-site-91}"
 
@@ -18,6 +19,7 @@ Usage: ./start.sh [--restart|--stop|--status]
 Environment overrides:
   FRONTEND_HOST=$FRONTEND_HOST
   FRONTEND_PORT=$FRONTEND_PORT
+  FRONTEND_MODE=$FRONTEND_MODE  # preview (default, no HMR) or dev
   BACKEND_PORT=$BACKEND_PORT
   LOG_DIR=$LOG_DIR
 
@@ -116,11 +118,24 @@ start_frontend() {
 
   need_cmd npm
   mkdir -p "$LOG_DIR"
-  echo "starting frontend on $FRONTEND_HOST:$FRONTEND_PORT"
-  (
-    cd "$ROOT_DIR"
-    setsid nohup npm run dev -- --host "$FRONTEND_HOST" --port "$FRONTEND_PORT" >>"$FRONTEND_LOG" 2>&1 </dev/null &
-  )
+  if [[ "$FRONTEND_MODE" == "dev" ]]; then
+    echo "starting frontend dev server on $FRONTEND_HOST:$FRONTEND_PORT"
+    (
+      cd "$ROOT_DIR"
+      setsid nohup npm run dev -- --host "$FRONTEND_HOST" --port "$FRONTEND_PORT" >>"$FRONTEND_LOG" 2>&1 </dev/null &
+    )
+  else
+    echo "building frontend for preview mode"
+    (
+      cd "$ROOT_DIR"
+      npm run build >>"$FRONTEND_LOG" 2>&1
+    )
+    echo "starting frontend preview server on $FRONTEND_HOST:$FRONTEND_PORT"
+    (
+      cd "$ROOT_DIR"
+      setsid nohup npm run preview -- --host "$FRONTEND_HOST" --port "$FRONTEND_PORT" >>"$FRONTEND_LOG" 2>&1 </dev/null &
+    )
+  fi
   wait_for_port "frontend" "$FRONTEND_PORT"
 }
 

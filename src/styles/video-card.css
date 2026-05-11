@@ -24,12 +24,6 @@
   }
 }
 
-@media (max-width: 380px) {
-  .video-grid {
-    grid-template-columns: 1fr;
-  }
-}
-
 .video-grid.is-compact {
   display: flex;
   flex-direction: column;
@@ -332,6 +326,10 @@
 }
 
 @media (max-width: 640px) {
+  .video-grid-loading {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .video-grid {
     gap: 9px;
   }

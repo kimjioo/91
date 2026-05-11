@@ -2,6 +2,7 @@ package preview
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/video-site/backend/internal/catalog"
@@ -228,7 +230,7 @@ func (g *Generator) GenerateThumbnail(ctx context.Context, link *drives.StreamLi
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		os.Remove(dst)
-		return "", fmt.Errorf("ffmpeg thumb: %w, stderr: %s", err, string(out))
+		return "", ffmpegCommandError("ffmpeg thumb", err, out)
 	}
 	if info, statErr := os.Stat(dst); statErr != nil || info.Size() == 0 {
 		os.Remove(dst)
@@ -256,9 +258,9 @@ func (g *Generator) Probe(ctx context.Context, link *drives.StreamLink) (float64
 	args = append(args, link.URL)
 
 	cmd := exec.CommandContext(ctx2, g.cfg.FFprobePath, args...)
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return 0, fmt.Errorf("ffprobe: %w", err)
+		return 0, ffmpegCommandError("ffprobe", err, out)
 	}
 	raw := strings.TrimSpace(string(out))
 	if raw == "" || raw == "N/A" {
@@ -362,7 +364,7 @@ func (g *Generator) Generate(ctx context.Context, link *drives.StreamLink, durat
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		os.Remove(tmpPath)
-		return "", fmt.Errorf("ffmpeg: %w, stderr: %s", err, string(out))
+		return "", ffmpegCommandError("ffmpeg", err, out)
 	}
 
 	if info, statErr := os.Stat(tmpPath); statErr != nil || info.Size() == 0 {
@@ -370,6 +372,48 @@ func (g *Generator) Generate(ctx context.Context, link *drives.StreamLink, durat
 		return "", fmt.Errorf("ffmpeg produced empty file, stderr: %s", string(out))
 	}
 	return tmpPath, nil
+}
+
+func ffmpegCommandError(tool string, err error, output []byte) error {
+	msg := fmt.Sprintf("%s: %v, stderr: %s", tool, err, redactURLs(string(output)))
+	wrapped := errors.New(msg)
+	if ffmpegOutputLooksRateLimited(output) {
+		return &drives.RateLimitError{
+			Provider: "media source",
+			Err:      wrapped,
+		}
+	}
+	return wrapped
+}
+
+func redactURLs(text string) string {
+	fields := strings.Fields(text)
+	for i, field := range fields {
+		if strings.HasPrefix(field, "http://") || strings.HasPrefix(field, "https://") {
+			suffix := ""
+			for len(field) > 0 {
+				last := field[len(field)-1]
+				if last != '.' && last != ',' && last != ';' && last != ')' {
+					break
+				}
+				suffix = string(last) + suffix
+				field = field[:len(field)-1]
+			}
+			fields[i] = "https://<redacted>" + suffix
+		}
+	}
+	return strings.Join(fields, " ")
+}
+
+func ffmpegOutputLooksRateLimited(output []byte) bool {
+	text := strings.ToLower(string(output))
+	if !strings.Contains(text, "429") {
+		return false
+	}
+	return strings.Contains(text, "too many requests") ||
+		strings.Contains(text, "rate limit") ||
+		strings.Contains(text, "rate-limit") ||
+		strings.Contains(text, "server returned 429")
 }
 
 // --- 本地落盘 ---
@@ -410,6 +454,9 @@ type Worker struct {
 	Drive     drives.Drive
 	RemoteDir string
 	ch        chan *catalog.Video
+
+	RateLimitCooldown time.Duration
+	rateLimit         rateLimitState
 }
 
 func NewWorker(gen TeaserGenerator, cat *catalog.Catalog, drv drives.Drive, remoteDir string) *Worker {
@@ -451,6 +498,46 @@ type ThumbWorker struct {
 	Catalog *catalog.Catalog
 	Drive   drives.Drive
 	ch      chan *catalog.Video
+
+	RateLimitCooldown time.Duration
+	rateLimit         rateLimitState
+}
+
+const defaultRateLimitCooldown = 30 * time.Minute
+
+type rateLimitState struct {
+	mu          sync.Mutex
+	until       time.Time
+	lastSkipLog time.Time
+}
+
+func (s *rateLimitState) active(now time.Time) (time.Time, bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.until.IsZero() || !now.Before(s.until) {
+		return time.Time{}, false, false
+	}
+	shouldLog := s.lastSkipLog.IsZero() || now.Sub(s.lastSkipLog) >= 5*time.Minute
+	if shouldLog {
+		s.lastSkipLog = now
+	}
+	return s.until, true, shouldLog
+}
+
+func (s *rateLimitState) pause(now time.Time, d time.Duration) time.Time {
+	if d <= 0 {
+		d = defaultRateLimitCooldown
+	}
+	until := now.Add(d)
+	s.mu.Lock()
+	if until.After(s.until) {
+		s.until = until
+	} else {
+		until = s.until
+	}
+	s.lastSkipLog = time.Time{}
+	s.mu.Unlock()
+	return until
 }
 
 func NewThumbWorker(gen ThumbnailGenerator, cat *catalog.Catalog, drv drives.Drive) *ThumbWorker {
@@ -520,9 +607,63 @@ func (w *ThumbWorker) Run(ctx context.Context) {
 	}
 }
 
+func (w *Worker) skipIfRateLimited(v *catalog.Video) bool {
+	until, ok, shouldLog := w.rateLimit.active(time.Now())
+	if !ok {
+		return false
+	}
+	if shouldLog {
+		log.Printf("[preview] drive=%s rate-limited until=%s; skip queued videos and keep them pending", w.Drive.ID(), until.Format(time.RFC3339))
+	}
+	return true
+}
+
+func (w *Worker) pauseForRateLimit(err error, step, title string) bool {
+	retryAfter, ok := drives.RateLimitRetryAfter(err)
+	if !ok {
+		return false
+	}
+	if retryAfter <= 0 {
+		retryAfter = w.RateLimitCooldown
+	}
+	until := w.rateLimit.pause(time.Now(), retryAfter)
+	log.Printf("[preview] drive=%s rate-limited until=%s step=%s video=%s: %v", w.Drive.ID(), until.Format(time.RFC3339), step, title, err)
+	return true
+}
+
+func (w *ThumbWorker) skipIfRateLimited(v *catalog.Video) bool {
+	until, ok, shouldLog := w.rateLimit.active(time.Now())
+	if !ok {
+		return false
+	}
+	if shouldLog {
+		log.Printf("[thumb] drive=%s rate-limited until=%s; skip queued thumbnails and keep them pending", w.Drive.ID(), until.Format(time.RFC3339))
+	}
+	return true
+}
+
+func (w *ThumbWorker) pauseForRateLimit(err error, step, title string) bool {
+	retryAfter, ok := drives.RateLimitRetryAfter(err)
+	if !ok {
+		return false
+	}
+	if retryAfter <= 0 {
+		retryAfter = w.RateLimitCooldown
+	}
+	until := w.rateLimit.pause(time.Now(), retryAfter)
+	log.Printf("[thumb] drive=%s rate-limited until=%s step=%s video=%s: %v", w.Drive.ID(), until.Format(time.RFC3339), step, title, err)
+	return true
+}
+
 func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) {
+	if w.skipIfRateLimited(v) {
+		return
+	}
 	link, err := w.Drive.StreamURL(ctx, v.FileID)
 	if err != nil {
+		if w.pauseForRateLimit(err, "streamURL", v.Title) {
+			return
+		}
 		log.Printf("[thumb] streamURL %s: %v", v.Title, err)
 		return
 	}
@@ -534,10 +675,15 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) {
 			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
 				DurationSeconds: int(dur),
 			})
+		} else if err != nil && w.pauseForRateLimit(err, "probe", v.Title) {
+			return
 		}
 	}
 
 	if _, err := w.Gen.GenerateThumbnail(ctx, link, v.ID, duration); err != nil {
+		if w.pauseForRateLimit(err, "generate", v.Title) {
+			return
+		}
 		log.Printf("[thumb] generate %s: %v", v.Title, err)
 		return
 	}
@@ -548,8 +694,14 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) {
 }
 
 func (w *Worker) process(ctx context.Context, v *catalog.Video) {
+	if w.skipIfRateLimited(v) {
+		return
+	}
 	link, err := w.Drive.StreamURL(ctx, v.FileID)
 	if err != nil {
+		if w.pauseForRateLimit(err, "streamURL", v.Title) {
+			return
+		}
 		log.Printf("[preview] streamURL %s: %v", v.Title, err)
 		w.Catalog.UpdatePreview(ctx, v.ID, "", "", "failed")
 		return
@@ -563,12 +715,17 @@ func (w *Worker) process(ctx context.Context, v *catalog.Video) {
 			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
 				DurationSeconds: int(dur),
 			})
+		} else if err != nil && w.pauseForRateLimit(err, "probe", v.Title) {
+			return
 		}
 	}
 
 	// 2) teaser
 	tmp, err := w.Gen.Generate(ctx, link, duration)
 	if err != nil {
+		if w.pauseForRateLimit(err, "generate", v.Title) {
+			return
+		}
 		log.Printf("[preview] generate %s: %v", v.Title, err)
 		w.Catalog.UpdatePreview(ctx, v.ID, "", "", "failed")
 		return
@@ -585,7 +742,11 @@ func (w *Worker) process(ctx context.Context, v *catalog.Video) {
 		if fid, uerr := w.uploadToDrive(ctx, v.ID, local); uerr == nil {
 			previewFileID = fid
 		} else {
-			log.Printf("[preview] upload %s: %v (local only)", v.Title, uerr)
+			if w.pauseForRateLimit(uerr, "upload", v.Title) {
+				log.Printf("[preview] upload %s: %v (local only; drive cooling down)", v.Title, uerr)
+			} else {
+				log.Printf("[preview] upload %s: %v (local only)", v.Title, uerr)
+			}
 		}
 	}
 	removePreviousLocalTeaser(v.PreviewLocal, local)

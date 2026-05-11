@@ -2,6 +2,7 @@ package preview
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -108,6 +109,52 @@ func TestPreviewWorkerRemovesPreviousLocalTeaserAfterNewTeaserIsReady(t *testing
 	}
 }
 
+func TestPreviewWorkerRateLimitLeavesCurrentPendingAndSkipsNextVideo(t *testing.T) {
+	ctx := context.Background()
+	cat, first := seedPreviewTestVideo(t, "preview-rate-limit-1")
+	second := *first
+	second.ID = "preview-rate-limit-2"
+	second.FileID = "file-id-2"
+	if err := cat.UpsertVideo(ctx, &second); err != nil {
+		t.Fatalf("seed second video: %v", err)
+	}
+
+	gen := &fakeTeaserGenerator{
+		generateErr: &drives.RateLimitError{
+			Provider:   "onedrive",
+			RetryAfter: 2 * time.Hour,
+			Err:        errors.New("429 Too Many Requests"),
+		},
+	}
+	drv := &previewFakeDrive{}
+	worker := NewWorker(gen, cat, drv, "")
+
+	worker.process(ctx, first)
+	gotFirst, err := cat.GetVideo(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("get first video: %v", err)
+	}
+	if gotFirst.PreviewStatus != "pending" {
+		t.Fatalf("first preview status = %q, want pending after rate limit", gotFirst.PreviewStatus)
+	}
+	if gen.generateCalls != 1 {
+		t.Fatalf("generate calls = %d, want 1", gen.generateCalls)
+	}
+
+	gen.generateErr = nil
+	worker.process(ctx, &second)
+	gotSecond, err := cat.GetVideo(ctx, second.ID)
+	if err != nil {
+		t.Fatalf("get second video: %v", err)
+	}
+	if gotSecond.PreviewStatus != "pending" {
+		t.Fatalf("second preview status = %q, want pending while drive is cooling down", gotSecond.PreviewStatus)
+	}
+	if gen.generateCalls != 1 {
+		t.Fatalf("generate calls = %d, want second video skipped during cooldown", gen.generateCalls)
+	}
+}
+
 func seedPreviewTestVideo(t *testing.T, id string) (*catalog.Catalog, *catalog.Video) {
 	t.Helper()
 	ctx := context.Background()
@@ -153,7 +200,9 @@ func (g *fakeThumbGenerator) GenerateThumbnail(_ context.Context, _ *drives.Stre
 }
 
 type fakeTeaserGenerator struct {
-	localPath string
+	localPath     string
+	generateErr   error
+	generateCalls int
 }
 
 func (g *fakeTeaserGenerator) Probe(context.Context, *drives.StreamLink) (float64, error) {
@@ -161,6 +210,10 @@ func (g *fakeTeaserGenerator) Probe(context.Context, *drives.StreamLink) (float6
 }
 
 func (g *fakeTeaserGenerator) Generate(context.Context, *drives.StreamLink, float64) (string, error) {
+	g.generateCalls++
+	if g.generateErr != nil {
+		return "", g.generateErr
+	}
 	return "/tmp/source-teaser.mp4", nil
 }
 

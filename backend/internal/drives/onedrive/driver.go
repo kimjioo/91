@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -265,6 +266,9 @@ func (d *Driver) requestOnce(ctx context.Context, rawURL, method string, configu
 	if err != nil {
 		return err
 	}
+	if isRateLimitResponse(res, graphErr.Error.Code) {
+		return onedriveRateLimitError(res, graphErr.Error.Message)
+	}
 	if graphErr.Error.Code != "" {
 		if graphErr.Error.Code == "InvalidAuthenticationToken" && retry {
 			if err := d.refresh(ctx); err != nil {
@@ -298,6 +302,9 @@ func (d *Driver) refresh(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("onedrive refresh token: %w", err)
 	}
+	if res.StatusCode() == http.StatusTooManyRequests {
+		return onedriveRateLimitError(res, "token refresh throttled")
+	}
 	if out.Text != "" {
 		return fmt.Errorf("onedrive refresh token: %s", out.Text)
 	}
@@ -319,6 +326,47 @@ func (d *Driver) refresh(ctx context.Context) error {
 		d.onTokenUpdate(out.AccessToken, out.RefreshToken)
 	}
 	return nil
+}
+
+func isRateLimitResponse(res *resty.Response, code string) bool {
+	if code == "TooManyRequests" || code == "activityLimitReached" {
+		return true
+	}
+	return res != nil && res.StatusCode() == http.StatusTooManyRequests
+}
+
+func onedriveRateLimitError(res *resty.Response, message string) error {
+	if strings.TrimSpace(message) == "" {
+		message = "onedrive rate limited"
+	}
+	if res != nil && strings.TrimSpace(res.String()) != "" {
+		message = fmt.Sprintf("%s: status=%d body=%s", message, res.StatusCode(), strings.TrimSpace(res.String()))
+	}
+	return &drives.RateLimitError{
+		Provider:   "onedrive",
+		RetryAfter: parseRetryAfter(res),
+		Err:        errors.New(message),
+	}
+}
+
+func parseRetryAfter(res *resty.Response) time.Duration {
+	if res == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(res.Header().Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(raw); err == nil {
+		d := time.Until(when)
+		if d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func (d *Driver) driveBaseURL() string {

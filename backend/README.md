@@ -47,8 +47,10 @@ Git Bash / WSL 环境推荐从仓库根目录启动完整开发环境：
 
 ```bash
 npm install
-./start.sh
+./start.sh               # 默认前端 production preview，无热更新
 ```
+
+需要前端开发热更新时再用 `FRONTEND_MODE=dev ./start.sh --restart`。
 
 PowerShell 下可以分两个终端手动启动，后端命令如下：
 
@@ -70,7 +72,8 @@ go run ./cmd/server
 `vite.config.ts` 已经把 `/api`、`/p`、`/admin/api` 代理到 `127.0.0.1:9192`。
 
 ```
-npm run dev         前端 9191
+npm run build       构建前端静态资源
+npm run preview     前端 9191，无热更新
 go run ./cmd/server 后端 9192
 ```
 
@@ -138,7 +141,7 @@ ffmpeg -ss <起点> -headers "UA/Cookie/Referer" -i <直链> \
 
 当前策略是每段固定 3 秒；30 秒以下最多 3 段，30 秒及以上固定 4 段；长视频在 20% 到 80% 区间均匀取段。优先把 teaser 上传回网盘的 `previews/` 目录；失败时保留本地 `data/previews/<videoID>.mp4` 作为兜底。
 
-服务启动或网盘重新挂载时，如果 Teaser 开关已开启，后端会把历史 `pending` 任务重新入队，避免重启后长期停在“待生成”。OneDrive 直链生成 teaser 时可能触发 Microsoft 429 限流；这类任务会标记为 `failed`，可稍后在视频管理页重生。
+服务启动或网盘重新挂载时，如果 Teaser 开关已开启，后端会把历史 `pending` 任务重新入队，避免重启后长期停在“待生成”。OneDrive 直链生成 teaser 时可能触发 Microsoft 429 限流；后端会识别这类错误并让当前网盘进入冷却期，保留任务为 `pending`，避免连续请求触发更严重限流。
 
 前端卡片的 `previewSrc` 统一指向 `/p/preview/<videoID>`，后端自动选择网盘代理或本地文件。
 

@@ -3,11 +3,13 @@ package onedrive
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/video-site/backend/internal/drives"
 )
@@ -171,6 +173,42 @@ func TestGraphItemWithoutFolderFacetIsNotDirectory(t *testing.T) {
 
 	if got.IsDir {
 		t.Fatalf("special Graph item without folder facet should not be treated as a directory: %#v", got)
+	}
+}
+
+func TestGraph429ReturnsRateLimitErrorWithRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"code":    "TooManyRequests",
+				"message": "throttled",
+			},
+		}); err != nil {
+			t.Fatalf("write json: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	d := New(Config{
+		ID:           "od-main",
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
+		APIBaseURL:   srv.URL,
+	})
+
+	_, err := d.List(context.Background(), "root")
+	if err == nil {
+		t.Fatal("list succeeded, want rate limit error")
+	}
+	var rateLimit *drives.RateLimitError
+	if !errors.As(err, &rateLimit) {
+		t.Fatalf("error = %T %[1]v, want RateLimitError", err)
+	}
+	if rateLimit.RetryAfter != 2*time.Minute {
+		t.Fatalf("retry after = %v, want 2m", rateLimit.RetryAfter)
 	}
 }
 

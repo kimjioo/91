@@ -64,3 +64,38 @@ type StreamLink struct {
 
 // ErrNotSupported 代表某家盘不支持某操作
 var ErrNotSupported = errors.New("operation not supported by this drive")
+
+// RateLimitError 表示上游服务正在限流。RetryAfter 为 0 时由调用方选择默认冷却时间。
+type RateLimitError struct {
+	Provider   string
+	RetryAfter time.Duration
+	Err        error
+}
+
+func (e *RateLimitError) Error() string {
+	if e == nil {
+		return "rate limited"
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	if e.Provider != "" {
+		return e.Provider + " rate limited"
+	}
+	return "rate limited"
+}
+
+func (e *RateLimitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func RateLimitRetryAfter(err error) (time.Duration, bool) {
+	var rateLimit *RateLimitError
+	if errors.As(err, &rateLimit) {
+		return rateLimit.RetryAfter, true
+	}
+	return 0, false
+}

@@ -1,8 +1,12 @@
 package preview
 
 import (
+	"errors"
 	"math"
+	"strings"
 	"testing"
+
+	"github.com/video-site/backend/internal/drives"
 )
 
 func TestNewDefaultsToThreeSecondTeaserSegments(t *testing.T) {
@@ -83,5 +87,27 @@ func TestShortVideoPreviewPlanReturnsNoSegmentsWhenOneSegmentCannotFit(t *testin
 	}
 	if plan.eachSec != 3 {
 		t.Fatalf("eachSec = %.2f, want 3", plan.eachSec)
+	}
+}
+
+func TestFFmpeg429OutputBecomesRateLimitError(t *testing.T) {
+	err := ffmpegCommandError("ffmpeg", errors.New("exit status 8"), []byte("Server returned 429 Too Many Requests"))
+	var rateLimit *drives.RateLimitError
+	if !errors.As(err, &rateLimit) {
+		t.Fatalf("error = %T %[1]v, want RateLimitError", err)
+	}
+	if rateLimit.RetryAfter != 0 {
+		t.Fatalf("retry after = %v, want none from ffmpeg stderr", rateLimit.RetryAfter)
+	}
+}
+
+func TestFFmpegCommandErrorRedactsSignedURLs(t *testing.T) {
+	err := ffmpegCommandError("ffmpeg", errors.New("exit status 8"), []byte("Error opening input file https://download.example/file.mp4?tempauth=secret."))
+	got := err.Error()
+	if strings.Contains(got, "tempauth=secret") {
+		t.Fatalf("error leaked signed URL: %s", got)
+	}
+	if !strings.Contains(got, "https://<redacted>.") {
+		t.Fatalf("error = %q, want redacted URL with punctuation preserved", got)
 	}
 }
