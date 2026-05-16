@@ -202,19 +202,6 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 }
 
 func (d *Driver) downloadInfo(pickCode string) (*sdk.DownloadInfo, string, error) {
-	mobileUA := sdk.UAIosApp
-	if info, err := d.client.DownloadWithUAByAndroidAPI(pickCode, mobileUA); err == nil {
-		if info != nil && info.Url.Url != "" {
-			return info, mobileUA, nil
-		}
-	} else {
-		webInfo, webErr := d.client.DownloadWithUA(pickCode, d.ua)
-		if webErr != nil {
-			return nil, "", fmt.Errorf("android api: %v; chrome api: %w", err, webErr)
-		}
-		return webInfo, d.ua, nil
-	}
-
 	info, err := d.client.DownloadWithUA(pickCode, d.ua)
 	if err != nil {
 		return nil, "", err

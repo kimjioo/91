@@ -383,6 +383,9 @@ func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
 	})
 	worker := preview.NewWorker(gen, a.cat, drv, "")
 	thumbWorker := preview.NewThumbWorker(gen, a.cat, drv)
+	if drv.Kind() == "p115" {
+		preview.ShareGenerationState(worker, thumbWorker)
+	}
 
 	workerCtx, cancel := context.WithCancel(ctx)
 	go worker.Run(workerCtx)
