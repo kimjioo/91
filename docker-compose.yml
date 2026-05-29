@@ -1,0 +1,13 @@
+services:
+  video-site-91:
+    build: .
+    container_name: video-site-91
+    restart: always
+    ports:
+      - "9191:9191"
+    volumes:
+      # 将宿主机的 ./data 目录挂载到容器内，实现数据持久化
+      - ./data:/opt/video-site-91/data
+    environment:
+      # 如果你需要换端口，可以直接在这里改，无需重新构建镜像
+      - FRONTEND_PORT=9191
