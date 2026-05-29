@@ -1,0 +1,11 @@
+# 执行编译并推送
+      - name: Build and push Docker image
+        uses: docker/build-and-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ id.meta.outputs.tags }}
+          labels: ${{ id.meta.outputs.labels }}
+          # 同时编译两种主流架构，生成的镜像会自动变成“多架构自适应镜像”
+          platforms: linux/amd64,linux/arm64
+          # (注意：这里的 build-args 已经被安全移除了)
