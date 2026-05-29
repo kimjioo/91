@@ -4,11 +4,11 @@ services:
     container_name: video-site-91
     restart: always
     ports:
-      - "9191:9191"
+      - "9191:8080"  # 保持之前的端口设置不变
     volumes:
-      # 1. 映射整个数据目录（完美包含 .db 数据库和 previews 文件夹）
+      # 现在只需要这一个映射就够了，数据和配置都在里面
       - ./data:/opt/video-site-91/data
-      # 2. 单独映射核心配置文件
-      - ./config.yaml:/opt/video-site-91/config.yaml
     environment:
       - FRONTEND_PORT=9191
+      # 告诉程序，配置文件现在放在 data 目录下了！
+      - VIDEO_CONFIG=/opt/video-site-91/data/config.yaml
